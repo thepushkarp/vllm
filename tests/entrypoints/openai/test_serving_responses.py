@@ -16,6 +16,7 @@ from openai.types.responses.tool import (
 from vllm.entrypoints.context import ConversationContext
 from vllm.entrypoints.openai.engine.protocol import ErrorResponse, ResponsesRequest
 from vllm.entrypoints.openai.serving_responses import (
+    HarmonyStreamingState,
     OpenAIServingResponses,
     _extract_allowed_tools_from_mcp_requests,
     extract_tool_types,
@@ -350,3 +351,122 @@ class TestExtractAllowedToolsFromMcpRequests:
             "server1": ["tool1"],
             "server2": ["tool2"],
         }
+
+
+class TestHarmonyPreambleStreaming:
+    """Tests for preamble (commentary with no recipient) streaming events."""
+
+    @pytest_asyncio.fixture
+    async def serving(self):
+        """Minimal OpenAIServingResponses for unit-testing emit helpers."""
+        engine_client = MagicMock()
+        model_config = MagicMock()
+        model_config.hf_config.model_type = "test"
+        model_config.get_diff_sampling_param.return_value = {}
+        engine_client.model_config = model_config
+        engine_client.input_processor = MagicMock()
+        engine_client.io_processor = MagicMock()
+        return OpenAIServingResponses(
+            engine_client=engine_client,
+            models=MagicMock(),
+            request_logger=None,
+            chat_template=None,
+            chat_template_content_format="auto",
+        )
+
+    @staticmethod
+    def _make_ctx(*, channel, recipient, delta="hello"):
+        """Build a lightweight mock StreamingHarmonyContext."""
+        ctx = MagicMock()
+        ctx.last_content_delta = delta
+        ctx.parser.current_channel = channel
+        ctx.parser.current_recipient = recipient
+        return ctx
+
+    @staticmethod
+    def _make_previous_item(*, channel, recipient, text="preamble text"):
+        """Build a lightweight mock previous_item (openai_harmony Message)."""
+        content_part = MagicMock()
+        content_part.text = text
+        item = MagicMock()
+        item.channel = channel
+        item.recipient = recipient
+        item.content = [content_part]
+        return item
+
+    # -- Gap 1: _emit_content_delta_events preamble branch --
+
+    def test_preamble_delta_emits_text_events(self, serving):
+        """commentary + recipient=None should emit output_text.delta events."""
+        ctx = self._make_ctx(channel="commentary", recipient=None)
+        state = HarmonyStreamingState()
+
+        events = serving._emit_content_delta_events(ctx, state)
+
+        assert len(events) > 0
+        type_names = [e.type for e in events]
+        # Must contain a text delta event
+        assert "response.output_text.delta" in type_names
+        # First preamble should also get output_item.added
+        assert "response.output_item.added" in type_names
+
+    def test_preamble_delta_second_token_no_added(self, serving):
+        """Second preamble token should emit delta only, not added again."""
+        ctx = self._make_ctx(channel="commentary", recipient=None, delta="w")
+        state = HarmonyStreamingState()
+        state.sent_output_item_added = True
+        state.current_item_id = "msg_test"
+        state.current_content_index = 0
+
+        events = serving._emit_content_delta_events(ctx, state)
+
+        type_names = [e.type for e in events]
+        assert "response.output_text.delta" in type_names
+        assert "response.output_item.added" not in type_names
+
+    def test_commentary_with_function_recipient_not_preamble(self, serving):
+        """commentary + recipient='functions.X' must NOT use preamble path."""
+        ctx = self._make_ctx(
+            channel="commentary",
+            recipient="functions.get_weather",
+        )
+        state = HarmonyStreamingState()
+
+        events = serving._emit_content_delta_events(ctx, state)
+
+        type_names = [e.type for e in events]
+        # Should NOT produce output_text.delta (that's preamble/final)
+        assert "response.output_text.delta" not in type_names
+
+    # -- Gap 2: _emit_previous_item_done_events preamble branch --
+
+    def test_preamble_done_emits_text_done_events(self, serving):
+        """Completed preamble should emit text done + content_part done +
+        output_item done, same shape as final channel."""
+        previous = self._make_previous_item(channel="commentary", recipient=None)
+        state = HarmonyStreamingState()
+        state.current_item_id = "msg_test"
+        state.current_output_index = 0
+        state.current_content_index = 0
+
+        events = serving._emit_previous_item_done_events(previous, state)
+
+        type_names = [e.type for e in events]
+        assert "response.output_text.done" in type_names
+        assert "response.content_part.done" in type_names
+        assert "response.output_item.done" in type_names
+
+    def test_commentary_with_recipient_no_preamble_done(self, serving):
+        """commentary + recipient='functions.X' should route to function call
+        done, not preamble done."""
+        previous = self._make_previous_item(
+            channel="commentary", recipient="functions.get_weather"
+        )
+        state = HarmonyStreamingState()
+        state.current_item_id = "fc_test"
+
+        events = serving._emit_previous_item_done_events(previous, state)
+
+        type_names = [e.type for e in events]
+        # Should NOT produce output_text.done (that's preamble/final)
+        assert "response.output_text.done" not in type_names

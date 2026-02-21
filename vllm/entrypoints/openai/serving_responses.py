@@ -1806,6 +1806,9 @@ class OpenAIServingResponses(OpenAIServing):
             return self._emit_reasoning_done_events(previous_item, state)
         elif previous_item.channel == "final":
             return self._emit_text_output_done_events(previous_item, state)
+        elif previous_item.channel == "commentary" and previous_item.recipient is None:
+            # Preambles are visible text, same done-event shape as final channel.
+            return self._emit_text_output_done_events(previous_item, state)
         return []
 
     def _emit_final_channel_delta_events(
@@ -2067,6 +2070,13 @@ class OpenAIServingResponses(OpenAIServing):
             and ctx.parser.current_recipient is None
         ):
             return self._emit_analysis_channel_delta_events(ctx, state)
+        elif (
+            ctx.parser.current_channel == "commentary"
+            and ctx.parser.current_recipient is None
+        ):
+            # Preambles (commentary without recipient) are visible to user,
+            # same wire format as final channel text.
+            return self._emit_final_channel_delta_events(ctx, state)
         # built-in tools will be triggered on the analysis channel
         # However, occasionally built-in tools will
         # still be output to commentary.
